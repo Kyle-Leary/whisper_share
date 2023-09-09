@@ -41,7 +41,7 @@ void sigsegv(int signal) {
 }
 
 WColMap method_map;
-WColMap route_map;
+WColMap route_alias_map;
 
 typedef struct HTTPHeader {
   HTTPMethod method;
@@ -123,14 +123,6 @@ void parse_header(HTTPHeader *header, char *request) {
   }
 }
 
-const char http_error_response[] =
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Type: text/html; charset=UTF-8\r\n\r\n"
-    "<p>ERROR!</p>";
-
-#define RETURN_ERROR(client_socket, message)                                   \
-  { send(client_socket, http_error_response, sizeof(http_error_response), 0); }
-
 #define RESPONSE_HEADER_BUF_SZ 1024
 
 int status_line(char *response_buf, int buf_sz_remaining,
@@ -158,12 +150,12 @@ int newline(char *response_buf, int buf_sz_remaining) {
   return n;
 }
 
-void client_send_file(const char *file_path, int client_socket_fd) {
+int client_send_file(const char *file_path, int client_socket_fd) {
   int file_fd = open(file_path, O_RDONLY);
   if (file_fd == -1) {
     perror("open");
     // Handle error
-    return;
+    return -1;
   }
 
   struct stat file_stat;
@@ -171,7 +163,7 @@ void client_send_file(const char *file_path, int client_socket_fd) {
     perror("fstat");
     // Handle error
     close(file_fd);
-    return;
+    return -1;
   }
 
   char header_buf[RESPONSE_HEADER_BUF_SZ];
@@ -226,7 +218,29 @@ void client_send_file(const char *file_path, int client_socket_fd) {
   if (bytes_sent == -1) {
     perror("sendfile");
     // Handle error
+    return -1;
   }
+
+  return 0;
+}
+
+int client_send_error(int client_socket, const char *message) {
+  char http_error_response[1024];
+
+  int n = snprintf(http_error_response, sizeof(http_error_response),
+                   "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: text/html; charset=UTF-8\r\n\r\n"
+                   "<p>ERROR: %s</p>",
+                   message);
+
+  ssize_t bytes_sent = send(client_socket, http_error_response, n, 0);
+
+  if (bytes_sent == -1) {
+    perror("send");
+    return -1;
+  }
+
+  return 0;
 }
 
 void *handle_client_thread(void *data) {
@@ -258,12 +272,23 @@ void *handle_client_thread(void *data) {
     // do general header handling.
     switch (h.method) {
     case GET: {
+      const char *path;
       printf("GET to '%s'\n", h.route_path);
+      path = w_cm_get(&route_alias_map, h.route_path);
+      if (path == NULL) {
+        path = h.route_path;
+      } else {
+        printf("aliasing '%s' to '%s'\n", h.route_path, path);
+      }
+
+      // otherwise, just send the whole file itself by default.
       // skip the first / and do it relative to the server's pwd.
-      client_send_file(h.route_path + 1, c->socket);
+      if (client_send_file(path + 1, c->socket) != 0) {
+        client_send_error(c->socket, "could not send file.");
+      }
     } break;
     default: {
-      RETURN_ERROR(c->socket, "incorrect method.");
+      client_send_error(c->socket, "incorrect method.");
     } break;
     }
 
@@ -290,6 +315,16 @@ int main(int argc, char **argv) {
   const int port = atoi(argv[1]);
 
   signal(SIGSEGV, sigsegv);
+
+  w_create_cm(&route_alias_map, PATH_BUF_SZ, 509);
+
+#define INSERT_ALIAS(route_alias_from, route_alias_to)                         \
+  { w_cm_insert(&route_alias_map, route_alias_from, route_alias_to); }
+
+  INSERT_ALIAS("/", "/pages/index.html");
+  INSERT_ALIAS("/about", "/pages/about.html");
+
+#undef INSERT_ALIAS
 
   w_create_cm(&method_map, sizeof(HTTPMethod), 509);
 #define INSERT_METHOD(method_lit, method_variant)                              \
