@@ -1,35 +1,95 @@
 #include <arpa/inet.h>
+#include <bits/pthreadtypes.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#define _GNU_SOURCE
+#include <execinfo.h>
 
+#include <fcntl.h>
+#include <sys/sendfile.h>
+#include <sys/stat.h>
+
+#include "error.html.h"
 #include "index.html.h"
 
-#define PATH_BUF_SZ 256
+#include "whisper/array.h"
+#include "whisper/colmap.h"
 
-typedef enum HTTPMethod {
-  POST,
-  GET,
-  DELETE,
-  PUT,
-} HTTPMethod;
+#include "httpdef.h"
+
+#define PATH_BUF_SZ 256
+#define MAX_CLIENTS 512
+
+void clean_main();
+
+void sigsegv(int signal) {
+  void *array[10];
+  size_t size;
+
+  // Get void*'s for all entries on the stack
+  size = backtrace(array, 10);
+
+  fprintf(stderr, "\n\nSEGFAULT sig %d: stacktrace - \n", signal);
+  backtrace_symbols_fd(array, size, STDERR_FILENO);
+
+  clean_main();
+  exit(1);
+}
+
+WColMap method_map;
+WColMap route_map;
 
 typedef struct HTTPHeader {
   HTTPMethod method;
-  char route[PATH_BUF_SZ];
+  char route_path[PATH_BUF_SZ];
+  int connection_close; // 1 if it should close.
 } HTTPHeader;
+
+typedef struct Client {
+  pthread_t thread;
+  int socket;
+} Client;
 
 void parse_method_line(HTTPHeader *header, char *method_line) {
   int len = strlen(method_line);
+
+  // parse method
   char *method_tok = strtok(method_line, " ");
+  HTTPMethod *m_ptr = (HTTPMethod *)w_cm_get(&method_map, method_tok);
+  if (m_ptr) {
+    header->method = *m_ptr;
+  } else {
+    fprintf(stderr, "ERROR: Invalid HTTP method '%s'.\n", method_tok);
+  }
+
+  // parse route
   char *route_tok = strtok(NULL, " ");
-  char *protocol_tok = strtok(NULL, " ");
+  strncpy(header->route_path, route_tok, PATH_BUF_SZ);
 }
+
+// note; the compiler will run through the strlen on a static string at
+// compile-time. doing strlen here is 0 overhead.
+#define IS_SAME(str1, str_lit) (strncmp(str1, str_lit, strlen(str_lit)) == 0)
 
 void parse_line(HTTPHeader *header, char *line) {
   int len = strlen(line);
   for (int i = 0; i < len; i++) {
+    char *key_tok = strtok(line, " ");
+
+    if (IS_SAME(key_tok, "Connection:")) {
+      char *arg_tok = line + strlen(line) + 1;
+      if (IS_SAME(arg_tok, "keep-alive")) {
+        header->connection_close = 0;
+      } else if (IS_SAME(arg_tok, "close")) {
+        header->connection_close = 1;
+      }
+    }
   }
 }
 
@@ -65,29 +125,143 @@ void parse_header(HTTPHeader *header, char *request) {
   }
 }
 
-void handle_client(int client_socket) {
-  char buffer[2048];
-  ssize_t bytes_read = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
+const char http_error_response[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/html; charset=UTF-8\r\n\r\n" HTML_ERROR;
 
-  if (bytes_read < 1) {
-    perror("recv");
-    close(client_socket);
+#define RETURN_ERROR(client_socket, message)                                   \
+  { send(client_socket, http_error_response, sizeof(http_error_response), 0); }
+
+#define RESPONSE_HEADER_BUF_SZ 1024
+
+int status_line(char *response_buf, int buf_sz_remaining,
+                HTTPStatusCode status) {
+  int n = snprintf(response_buf, buf_sz_remaining, "HTTP/1.1 %d %s\r\n", status,
+                   get_reason_phrase(status));
+  return n;
+}
+
+int content_type(char *response_buf, int buf_sz_remaining, ContentType c_type) {
+  int n = snprintf(response_buf, buf_sz_remaining, "Content-Type: %s\r\n",
+                   get_content_type_string(c_type));
+  return n;
+}
+
+int content_length(char *response_buf, int buf_sz_remaining,
+                   unsigned long length) {
+  int n = snprintf(response_buf, buf_sz_remaining, "Content-Length: %lu\r\n",
+                   length);
+  return n;
+}
+
+int newline(char *response_buf, int buf_sz_remaining) {
+  int n = snprintf(response_buf, buf_sz_remaining, "\r\n");
+  return n;
+}
+
+void client_send_file(const char *file_path, int client_socket_fd) {
+  int file_fd = open(file_path, O_RDONLY);
+  if (file_fd == -1) {
+    perror("open");
+    // Handle error
     return;
   }
 
-  buffer[bytes_read] = '\0';
+  struct stat file_stat;
+  if (fstat(file_fd, &file_stat) == -1) {
+    perror("fstat");
+    // Handle error
+    close(file_fd);
+    return;
+  }
 
-  printf("Received request:\n%s\n", buffer);
-  HTTPHeader h;
-  parse_header(&h, buffer);
+  char header_buf[RESPONSE_HEADER_BUF_SZ];
+  char *_header = header_buf;
+  int remaining = RESPONSE_HEADER_BUF_SZ;
 
-  char http_response[] =
-      "HTTP/1.1 200 OK\r\n"
-      "Content-Type: text/html; charset=UTF-8\r\n\r\n" HTML_INDEX;
+#define APPEND(fn, ...)                                                        \
+  {                                                                            \
+    int n = fn(_header, remaining, ##__VA_ARGS__);                             \
+    _header += n;                                                              \
+    remaining -= n;                                                            \
+  }
 
-  send(client_socket, http_response, sizeof(http_response), 0);
-  close(client_socket);
+  APPEND(status_line, OK);
+  APPEND(content_type, TEXT_PLAIN);
+  APPEND(content_length, file_stat.st_size);
+  APPEND(newline);
+
+  // we can write to the socket in multiple calls, one for the http header and
+  // one for the file. here, make the header.
+
+  // send is basically just write with more stuff around it that makes it better
+  // for direct socket communication. for example, it's got the options param as
+  // the fourth that allows better control over the actual fd write.
+  send(client_socket_fd, header_buf, RESPONSE_HEADER_BUF_SZ - remaining, 0);
+
+  // be super efficient and use the proper linux syscalls instead of reading
+  // and writing into a buffer just to send an entire file.
+  ssize_t bytes_sent =
+      sendfile(client_socket_fd, file_fd, NULL, file_stat.st_size);
+
+  if (bytes_sent == -1) {
+    perror("sendfile");
+    // Handle error
+  }
 }
+
+void *handle_client_thread(void *data) {
+  Client *c = (Client *)data;
+
+  signal(SIGSEGV, sigsegv);
+
+  for (;;) {
+    char buffer[2048];
+    ssize_t bytes_read = recv(c->socket, buffer, sizeof(buffer) - 1, 0);
+
+    if (bytes_read < 1) {
+      if (bytes_read == 0) {
+        printf("Connection closed by client\n");
+      } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        printf("recv() timed out\n");
+      } else {
+        perror("recv other error");
+      }
+      break;
+    }
+
+    buffer[bytes_read] = '\0';
+
+    printf("Received request:\n%s\n", buffer);
+    HTTPHeader h;
+    parse_header(&h, buffer);
+
+    // do general header handling.
+    switch (h.method) {
+    case GET: {
+      printf("GET to '%s'\n", h.route_path);
+      // skip the first / and do it relative to the server's pwd.
+      client_send_file(h.route_path + 1, c->socket);
+    } break;
+    default: {
+      RETURN_ERROR(c->socket, "incorrect method.");
+    } break;
+    }
+
+    // close the connection AFTER the current request has been handled.
+    if (h.connection_close) {
+      break;
+    }
+  }
+
+  // always close the connection at the end of the thread.
+  close(c->socket);
+  return NULL;
+}
+
+WArray client_array;
+
+static int server_socket;
 
 int main(int argc, char **argv) {
   if (argc != 2) {
@@ -96,7 +270,22 @@ int main(int argc, char **argv) {
   }
   const int port = atoi(argv[1]);
 
-  int server_socket, client_socket;
+  signal(SIGSEGV, sigsegv);
+
+  w_create_cm(&method_map, sizeof(HTTPMethod), 509);
+#define INSERT_METHOD(method_lit, method_variant)                              \
+  {                                                                            \
+    HTTPMethod m = method_variant;                                             \
+    w_cm_insert(&method_map, method_lit, &m);                                  \
+  }
+
+  INSERT_METHOD("GET", GET);
+
+#undef INSERT_METHOD
+
+  w_make_array(&client_array, sizeof(Client), MAX_CLIENTS);
+
+  int client_socket;
   struct sockaddr_in server_address, client_address;
   socklen_t client_len = sizeof(client_address);
 
@@ -104,6 +293,15 @@ int main(int argc, char **argv) {
 
   if (server_socket == -1) {
     perror("socket");
+    exit(1);
+  }
+
+  // make it impossible for the server socket to orphan itself and stick on the
+  // port.
+  int enable = 1;
+  if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &enable,
+                 sizeof(int)) < 0) {
+    perror("setsockopt(SO_REUSEADDR) failed");
     exit(1);
   }
 
@@ -133,8 +331,48 @@ int main(int argc, char **argv) {
       exit(1);
     }
 
-    handle_client(client_socket);
+    struct timeval timeout;
+    timeout.tv_sec = 60; // 60 seconds timeout
+    timeout.tv_usec = 0;
+
+    if (setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout,
+                   sizeof(timeout)) < 0) {
+      perror("setsockopt");
+    }
+
+    if (setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout,
+                   sizeof(timeout)) < 0) {
+      perror("setsockopt");
+    }
+
+    Client *c = w_array_alloc(&client_array);
+    c->socket = client_socket;
+    pthread_create(&c->thread, NULL, handle_client_thread, c);
+    handle_client_thread(&c);
   }
 
+  clean_main();
+
   return 0;
+}
+
+static int has_cleaned = 0;
+
+void clean_main() {
+  // multiple different threads might call this.
+  if (has_cleaned) {
+    return;
+  }
+
+  has_cleaned++;
+
+  if (close(server_socket) == -1) {
+    perror("Failed to clean server socket");
+  }
+
+  for (int i = 0; i < client_array.upper_bound; i++) {
+    Client *c = w_array_get(&client_array, i);
+    if (c)
+      close(c->socket);
+  }
 }

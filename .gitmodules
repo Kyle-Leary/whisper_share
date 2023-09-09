@@ -1,0 +1,3 @@
+[submodule "deps/libwhisper"]
+	path = deps/libwhisper
+	url = https://github.com/Kyle-Leary/libwhisper.git
