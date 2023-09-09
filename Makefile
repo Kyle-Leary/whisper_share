@@ -7,37 +7,20 @@ LIBWHISPER := deps/libwhisper/libwhisper.a
 STATIC := $(LIBWHISPER) 
 DEPS := $(STATIC)
 
-HTML_DIR=html
-HTML_SRCS=$(shell find $(HTML_DIR) -type f -name "*.html")
-HTML_HEADERS=$(patsubst %.html,%.html.h,$(HTML_SRCS))
-
-MK_HTML=mk_html
-MK_HTML_DIR=mk_html_src
-MK_HTML_SRCS=$(shell find $(MK_HTML_DIR) -type f -name "*.c")
-MK_HTML_OBJS=$(patsubst %.c,%.o,$(MK_HTML_SRCS))
-
 SERVER=server
 SERVER_DIR=server_src
 SERVER_SRCS=$(shell find $(SERVER_DIR) -type f -name "*.c")
 SERVER_OBJS=$(patsubst %.c,%.o,$(SERVER_SRCS))
 SERVER_SYMBOLS := $(SERVER_OBJS)
 SERVER_SYMBOLS += $(STATIC)
-SERVER_DEPS := $(HTML_HEADERS) $(SERVER_SYMBOLS) 
+SERVER_DEPS := $(SERVER_SYMBOLS) 
 
-INCLUDES=-I$(HTML_DIR) -Ideps/libwhisper/api
+INCLUDES=-Ideps/libwhisper/api
 LIBS=-lpthread
 CFLAGS+=$(INCLUDES)
 CFLAGS+=$(LIBS)
 
 all: $(SERVER)
-
-html: $(HTML_HEADERS)
-
-$(MK_HTML): $(MK_HTML_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
-
-%.html.h: %.html $(MK_HTML)
-	$(MK_HTML) $<
 
 host: $(SERVER) 
 	./$(SERVER) $(PORT)

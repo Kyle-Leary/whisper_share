@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,9 +15,6 @@
 #include <fcntl.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
-
-#include "error.html.h"
-#include "index.html.h"
 
 #include "whisper/array.h"
 #include "whisper/colmap.h"
@@ -127,7 +125,8 @@ void parse_header(HTTPHeader *header, char *request) {
 
 const char http_error_response[] =
     "HTTP/1.1 200 OK\r\n"
-    "Content-Type: text/html; charset=UTF-8\r\n\r\n" HTML_ERROR;
+    "Content-Type: text/html; charset=UTF-8\r\n\r\n"
+    "<p>ERROR!</p>";
 
 #define RETURN_ERROR(client_socket, message)                                   \
   { send(client_socket, http_error_response, sizeof(http_error_response), 0); }
@@ -187,9 +186,29 @@ void client_send_file(const char *file_path, int client_socket_fd) {
   }
 
   APPEND(status_line, OK);
-  APPEND(content_type, TEXT_PLAIN);
+  // then, choose a content-type based on the file extension.
+  ContentType c_type;
+  char *dot = strrchr(file_path, '.');
+  if (dot == NULL) {
+  } else {
+    char *ext = dot + 1;
+    if (IS_SAME(ext, "js")) {
+      c_type = APPLICATION_JAVASCRIPT;
+    } else if (IS_SAME(ext, "json")) {
+      c_type = APPLICATION_JSON;
+    } else if (IS_SAME(ext, "css")) {
+      c_type = TEXT_CSS;
+    } else if (IS_SAME(ext, "html")) {
+      c_type = TEXT_HTML;
+    } else {
+      c_type = TEXT_PLAIN;
+    }
+  }
+  APPEND(content_type, c_type);
   APPEND(content_length, file_stat.st_size);
   APPEND(newline);
+
+#undef APPEND
 
   // we can write to the socket in multiple calls, one for the http header and
   // one for the file. here, make the header.
